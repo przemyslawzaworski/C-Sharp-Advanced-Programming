@@ -28,6 +28,8 @@ using System;
 using System.IO;
 using Steamworks;
 using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 class Program
 {
@@ -42,6 +44,7 @@ class Program
 
 	static SteamWorkshopItem _CurrentSteamWorkshopItem;
 	static UGCUpdateHandle_t _UpdateHandle = UGCUpdateHandle_t.Invalid;
+	static List <string> _ModsReceivedResult = new List<string>();
 
 	static void UploadContent(string title, string description, string content, string[] tags, string image, bool update = false)
 	{
@@ -71,8 +74,7 @@ class Program
 			SteamUGC.SetItemPreview(_UpdateHandle, _CurrentSteamWorkshopItem.PreviewImagePath);
 			SteamUGC.SetItemVisibility(_UpdateHandle, ERemoteStoragePublishedFileVisibility.k_ERemoteStoragePublishedFileVisibilityPrivate);
 			SteamAPICall_t submitHandle = SteamUGC.SubmitItemUpdate(_UpdateHandle, "Initial commit");
-			CallResult<SubmitItemUpdateResult_t> OnSubmitItemUpdateResultCallResult = CallResult<SubmitItemUpdateResult_t>.Create();
-			OnSubmitItemUpdateResultCallResult.Set(submitHandle, OnSubmitItemUpdateResult);
+			SubmitAsync(submitHandle);
 		}
 		else
 		{
@@ -91,46 +93,53 @@ class Program
 		SteamUGC.SetItemPreview(_UpdateHandle, _CurrentSteamWorkshopItem.PreviewImagePath);
 		SteamUGC.SetItemVisibility(_UpdateHandle, ERemoteStoragePublishedFileVisibility.k_ERemoteStoragePublishedFileVisibilityPrivate);
 		SteamAPICall_t submitHandle = SteamUGC.SubmitItemUpdate(_UpdateHandle, changelog);
-		CallResult<SubmitItemUpdateResult_t> OnSubmitItemUpdateResultCallResult = CallResult<SubmitItemUpdateResult_t>.Create();
-		OnSubmitItemUpdateResultCallResult.Set(submitHandle, OnSubmitItemUpdateResult);
+		SubmitAsync(submitHandle);
 	}
-	
-	static void OnSubmitItemUpdateResult(SubmitItemUpdateResult_t param, bool bIOFailure)
+
+	static bool IsCompleted (SteamAPICall_t handle)
 	{
-		if (param.m_eResult == EResult.k_EResultOK)
+		return SteamUtils.IsAPICallCompleted(handle, out bool result);
+	}
+
+	static async void SubmitAsync(SteamAPICall_t submitHandle)
+	{
+		await Task.Run(() => SubmitTask(submitHandle));
+	}
+
+	static void SubmitTask(SteamAPICall_t submitHandle)
+	{
+		while (!IsCompleted(submitHandle)) 
 		{
-			_UpdateHandle = UGCUpdateHandle_t.Invalid;
+			if (_UpdateHandle != UGCUpdateHandle_t.Invalid)
+			{
+				System.Threading.Thread.Sleep(1);
+				EItemUpdateStatus status = SteamUGC.GetItemUpdateProgress(_UpdateHandle, out ulong punBytesProcessed, out ulong punBytesTotal);
+				float progress = (float)punBytesProcessed / (float)punBytesTotal * 100.0f;
+				if (status == EItemUpdateStatus.k_EItemUpdateStatusPreparingConfig) ClearLine("Processing configuration data...");
+				else if (status == EItemUpdateStatus.k_EItemUpdateStatusPreparingContent && !Single.IsNaN (progress)) ClearLine("Processing files: " + progress.ToString("F2") + " % ");
+				else if (status == EItemUpdateStatus.k_EItemUpdateStatusUploadingContent && !Single.IsNaN (progress)) ClearLine("Upload files: " + progress.ToString("F2") + " % ");
+				else if (status == EItemUpdateStatus.k_EItemUpdateStatusUploadingPreviewFile) ClearLine("Upload preview file...");				
+				else if (status == EItemUpdateStatus.k_EItemUpdateStatusCommittingChanges) ClearLine("Commiting changes...");
+			}
+		}
+		IntPtr pCallback = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SubmitItemUpdateResult_t)));
+		SteamUtils.GetAPICallResult(submitHandle, pCallback, Marshal.SizeOf(typeof(SubmitItemUpdateResult_t)), SubmitItemUpdateResult_t.k_iCallback, out bool pbFailed);
+		SubmitItemUpdateResult_t callback = (SubmitItemUpdateResult_t)Marshal.PtrToStructure(pCallback, typeof(SubmitItemUpdateResult_t));		
+		if (callback.m_eResult == EResult.k_EResultOK)
+		{
 			Console.WriteLine("\nSuccessfully submitted item to Steam ! Press any key to continue...");
 		}
 		else
 		{
-			_UpdateHandle = UGCUpdateHandle_t.Invalid;
-			Console.WriteLine("\nCouldn't submit the item to Steam (" + param.m_eResult.ToString() + ") ! Press any key to continue...");
+			Console.WriteLine("\nCouldn't submit the item to Steam (" + callback.m_eResult.ToString() + ") ! Press any key to continue...");
 		}
+		Marshal.FreeHGlobal(pCallback);
 	}
-		
+
 	static void ClearLine (string param)
 	{
 		Console.Write("\r" + new string(' ', Console.WindowWidth-1) + "\r");
 		Console.Write(param);
-	}
-
-	static async void ProgressBarAsync()
-	{
-		System.Threading.Thread.Sleep(2);
-		await Task.Run(() => ProgressBarTask());
-	}
-	
-	static void ProgressBarTask()
-	{
-		if (_UpdateHandle != UGCUpdateHandle_t.Invalid)
-		{
-			EItemUpdateStatus status = SteamUGC.GetItemUpdateProgress(_UpdateHandle, out ulong punBytesProcessed, out ulong punBytesTotal);
-			float progress = (float)punBytesProcessed / (float)punBytesTotal * 100.0f;
-			if (status == EItemUpdateStatus.k_EItemUpdateStatusPreparingContent && !Single.IsNaN (progress)) ClearLine("Processing files: " + progress.ToString("F2") + " % ");
-			if (status == EItemUpdateStatus.k_EItemUpdateStatusUploadingContent && !Single.IsNaN (progress)) ClearLine("Upload files: " + progress.ToString("F2") + " % ");
-			if (status == EItemUpdateStatus.k_EItemUpdateStatusCommittingChanges) ClearLine("Commiting changes...");
-		}
 	}
 
 	static async void UploadAsync(string content, string icon)
@@ -138,30 +147,71 @@ class Program
 		await Task.Run(() => UploadContent("Title", "Description", content, new string[1] {"item"}, icon, false));
 		Console.WriteLine ("Please Wait...");
 	}
-		
-	static void Main(string[] args)
+
+	static void GetModsInfoFromUser()
+	{
+		var query = SteamUGC.CreateQueryUserUGCRequest( SteamUser.GetSteamID().GetAccountID(), EUserUGCList.k_EUserUGCList_Published,
+			EUGCMatchingUGCType.k_EUGCMatchingUGCType_UsableInGame, EUserUGCListSortOrder.k_EUserUGCListSortOrder_VoteScoreDesc, 
+			SteamUtils.GetAppID(), SteamUtils.GetAppID(), 1 );
+		SteamAPICall_t request = SteamUGC.SendQueryUGCRequest( query );
+		CallResult<SteamUGCQueryCompleted_t> _userModsCallResult = CallResult<SteamUGCQueryCompleted_t>.Create(OnUserModsReceivedResult);
+		_userModsCallResult.Set( request );
+	}
+
+	static DateTime FromUnixTime(uint unixTime)
+	{
+		DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		return epoch.AddSeconds(unixTime);
+	}
+
+	static void OnUserModsReceivedResult( SteamUGCQueryCompleted_t result, bool failure )
+	{
+		Console.WriteLine("*************************************");
+		_ModsReceivedResult.Add("User mods: " + result.m_unNumResultsReturned.ToString());
+		for (uint i = 0; i < result.m_unNumResultsReturned; i++)
+		{
+			if (SteamUGC.GetQueryUGCResult(result.m_handle, i, out var details))
+			{
+				_ModsReceivedResult.Add("- " + details.m_rgchTitle.ToString() + ", " + details.m_rgchDescription.ToString()+", "+ FromUnixTime(details.m_rtimeUpdated).ToString() +", "+ details.m_nPublishedFileId.ToString());
+			}
+		}
+		SteamUGC.ReleaseQueryUGCRequest( result.m_handle );
+		for (int i = 0; i < _ModsReceivedResult.Count; i++) Console.WriteLine(_ModsReceivedResult[i]);
+		Console.WriteLine("*************************************");
+	}
+	
+	static void Start()
 	{
 		if (!SteamAPI.Init())
 		{
-			Console.WriteLine("SteamAPI.Init() failed!"); return;
+			Console.WriteLine("SteamAPI.Init() failed!"); Environment.Exit(0);
 		}
-		bool upload = true;
-		string contentpath = Directory.GetCurrentDirectory() + "\\Upload\\Content";
-		string iconpath = Directory.GetCurrentDirectory() + "\\Upload\\icon.png";
-		if (!Directory.Exists(contentpath) || !File.Exists(iconpath))
+		string content = Directory.GetCurrentDirectory() + "\\Upload\\Content";
+		string icon = Directory.GetCurrentDirectory() + "\\Upload\\icon.png";
+		if (!Directory.Exists(content) || !File.Exists(icon))
 		{
-			Console.WriteLine("Upload path or preview file not found !"); return;
+			Console.WriteLine("Upload path or preview file not found !"); Environment.Exit(0);
 		}
-		while (Console.KeyAvailable == false)
-		{
-			SteamAPI.RunCallbacks();
-			if (upload)
-			{
-				UploadAsync(contentpath, iconpath);
-			}
-			ProgressBarAsync();
-			upload = false;
-		}
+		SteamAPI.RunCallbacks();
+		GetModsInfoFromUser();
+		UploadAsync(content, icon);
+	}
+
+	static void Update()
+	{
+		while (!Console.KeyAvailable) SteamAPI.RunCallbacks();
+	}
+
+	static void Exit()
+	{
 		SteamAPI.Shutdown();
+		Environment.Exit(0);
+	}
+
+	static void Main(string[] args)
+	{
+		Start();
+		Update();
+		Exit();
 	}
 }

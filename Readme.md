@@ -2,6 +2,8 @@
 
 Repository will be updated regularly with new various examples.
 
+CUDA.cs - NVIDIA CUDA and C# (graphics demo)
+
 Disassembler.cs - Disassembler for managed DLLs, inspired by book "C# 10 in a Nutshell".
 
 GeodeticCalculator.cs - Transformation between two example Polish geodesic coordinates systems.
